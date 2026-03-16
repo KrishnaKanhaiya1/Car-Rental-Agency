@@ -1,0 +1,9 @@
+.mysql_data/
+.vscode/
+.idea/
+*.log
+vendor/
+node_modules/
+.DS_Store
+Thumbs.db
+config/database.php
