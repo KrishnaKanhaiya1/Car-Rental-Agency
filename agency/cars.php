@@ -14,8 +14,161 @@ $form = [
 ];
 $errors = [];
 
+/**
+ * @return array<string, array<string, mixed>>
+ */
+function cars_table_columns(PDO $pdo): array
+{
+    $stmt = $pdo->prepare(
+        'SELECT COLUMN_NAME,
+                DATA_TYPE,
+                COLUMN_TYPE,
+                IS_NULLABLE,
+                COLUMN_DEFAULT,
+                CHARACTER_MAXIMUM_LENGTH,
+                EXTRA
+         FROM information_schema.columns
+         WHERE table_schema = DATABASE() AND table_name = ?
+         ORDER BY ORDINAL_POSITION ASC'
+    );
+    $stmt->execute(['cars']);
+
+    $columns = [];
+
+    foreach ($stmt->fetchAll() as $column) {
+        $columnName = (string) ($column['COLUMN_NAME'] ?? '');
+
+        if ($columnName !== '') {
+            $columns[$columnName] = $column;
+        }
+    }
+
+    return $columns;
+}
+
+function cars_enum_first_option(string $columnType): ?string
+{
+    if (preg_match("/^enum\('((?:[^'\\\\]|\\\\.)*)'/i", $columnType, $matches) !== 1) {
+        return null;
+    }
+
+    return str_replace("\\'", "'", (string) $matches[1]);
+}
+
+/**
+ * @param array<string, mixed> $columnMeta
+ */
+function cars_apply_column_constraints($value, array $columnMeta)
+{
+    if (!is_string($value)) {
+        return $value;
+    }
+
+    $maxLengthRaw = $columnMeta['CHARACTER_MAXIMUM_LENGTH'] ?? null;
+
+    if ($maxLengthRaw === null || !is_numeric((string) $maxLengthRaw)) {
+        return $value;
+    }
+
+    $maxLength = (int) $maxLengthRaw;
+
+    if ($maxLength <= 0) {
+        return $value;
+    }
+
+    return substr($value, 0, $maxLength);
+}
+
+/**
+ * @param array<string, mixed> $columnMeta
+ * @param array<string, mixed> $sampleRow
+ */
+function cars_required_fallback_value(string $columnName, array $columnMeta, array $sampleRow)
+{
+    if (array_key_exists($columnName, $sampleRow) && $sampleRow[$columnName] !== null) {
+        return cars_apply_column_constraints($sampleRow[$columnName], $columnMeta);
+    }
+
+    $dataType = strtolower((string) ($columnMeta['DATA_TYPE'] ?? ''));
+
+    switch ($dataType) {
+        case 'tinyint':
+        case 'smallint':
+        case 'mediumint':
+        case 'int':
+        case 'bigint':
+            return 0;
+
+        case 'decimal':
+        case 'double':
+        case 'float':
+            return 0.0;
+
+        case 'date':
+            return date('Y-m-d');
+
+        case 'datetime':
+        case 'timestamp':
+            return date('Y-m-d H:i:s');
+
+        case 'time':
+            return date('H:i:s');
+
+        case 'enum':
+            $firstOption = cars_enum_first_option((string) ($columnMeta['COLUMN_TYPE'] ?? ''));
+            return $firstOption ?? '';
+
+        default:
+            return cars_apply_column_constraints('', $columnMeta);
+    }
+}
+
+/**
+ * @param array<string, mixed> $baseValues
+ * @return array<string, mixed>
+ */
+function cars_build_insert_values(PDO $pdo, array $baseValues): array
+{
+    $columns = cars_table_columns($pdo);
+
+    if ($columns === []) {
+        return $baseValues;
+    }
+
+    $sampleStmt = $pdo->query('SELECT * FROM cars ORDER BY id DESC LIMIT 1');
+    $sampleRow = $sampleStmt !== false ? ($sampleStmt->fetch() ?: []) : [];
+
+    $insertValues = [];
+
+    foreach ($columns as $columnName => $columnMeta) {
+        $extra = strtolower((string) ($columnMeta['EXTRA'] ?? ''));
+
+        if (strpos($extra, 'auto_increment') !== false) {
+            continue;
+        }
+
+        if (array_key_exists($columnName, $baseValues)) {
+            $insertValues[$columnName] = cars_apply_column_constraints($baseValues[$columnName], $columnMeta);
+            continue;
+        }
+
+        $isRequired = ((string) ($columnMeta['IS_NULLABLE'] ?? 'YES')) === 'NO'
+            && ($columnMeta['COLUMN_DEFAULT'] ?? null) === null;
+
+        if (!$isRequired) {
+            continue;
+        }
+
+        $insertValues[$columnName] = cars_required_fallback_value($columnName, $columnMeta, is_array($sampleRow) ? $sampleRow : []);
+    }
+
+    return $insertValues;
+}
+
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     enforce_csrf('agency/cars.php');
+
+    $carsColumns = cars_table_columns(db());
 
     $form['model'] = trim((string) ($_POST['model'] ?? ''));
     $form['vehicle_number'] = normalize_vehicle_number((string) ($_POST['vehicle_number'] ?? ''));
@@ -26,14 +179,29 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     $seatingCapacity = (int) $form['seating_capacity'];
     $rentPerDay = (float) $form['rent_per_day'];
 
+    $modelMaxLength = 120;
+    $vehicleNumberMaxLength = 20;
+
+    if (isset($carsColumns['model']['CHARACTER_MAXIMUM_LENGTH']) && is_numeric((string) $carsColumns['model']['CHARACTER_MAXIMUM_LENGTH'])) {
+        $modelMaxLength = (int) $carsColumns['model']['CHARACTER_MAXIMUM_LENGTH'];
+    }
+
+    if (isset($carsColumns['vehicle_number']['CHARACTER_MAXIMUM_LENGTH']) && is_numeric((string) $carsColumns['vehicle_number']['CHARACTER_MAXIMUM_LENGTH'])) {
+        $vehicleNumberMaxLength = (int) $carsColumns['vehicle_number']['CHARACTER_MAXIMUM_LENGTH'];
+    }
+
     if ($form['model'] === '') {
         $errors[] = 'Vehicle model is required.';
+    } elseif ($modelMaxLength > 0 && strlen($form['model']) > $modelMaxLength) {
+        $errors[] = 'Vehicle model cannot exceed ' . $modelMaxLength . ' characters for this deployment schema.';
     }
 
     if ($form['vehicle_number'] === '') {
         $errors[] = 'Vehicle number is required.';
     } elseif (!validate_vehicle_number($form['vehicle_number'])) {
         $errors[] = 'Vehicle number should contain letters, numbers, spaces, or dashes only.';
+    } elseif ($vehicleNumberMaxLength > 0 && strlen($form['vehicle_number']) > $vehicleNumberMaxLength) {
+        $errors[] = 'Vehicle number cannot exceed ' . $vehicleNumberMaxLength . ' characters for this deployment schema.';
     }
 
     if ($seatingCapacity < 1 || $seatingCapacity > 20) {
@@ -54,18 +222,63 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     }
 
     if ($errors === []) {
-        $insertCarStmt = db()->prepare('INSERT INTO cars (agency_id, model, vehicle_number, seating_capacity, rent_per_day, is_available) VALUES (?, ?, ?, ?, ?, ?)');
-        $insertCarStmt->execute([
-            $agencyId,
-            $form['model'],
-            $form['vehicle_number'],
-            $seatingCapacity,
-            $rentPerDay,
-            (int) $form['is_available'],
-        ]);
+        $pdo = db();
+        $insertSucceeded = false;
+        $baseInsertValues = [
+            'agency_id' => $agencyId,
+            'model' => $form['model'],
+            'vehicle_number' => $form['vehicle_number'],
+            'seating_capacity' => $seatingCapacity,
+            'rent_per_day' => $rentPerDay,
+            'is_available' => (int) $form['is_available'],
+        ];
 
-        flash('success', 'Car added to your fleet successfully.');
-        redirect('agency/cars.php');
+        try {
+            $insertCarStmt = $pdo->prepare('INSERT INTO cars (agency_id, model, vehicle_number, seating_capacity, rent_per_day, is_available) VALUES (?, ?, ?, ?, ?, ?)');
+            $insertCarStmt->execute([
+                $agencyId,
+                $form['model'],
+                $form['vehicle_number'],
+                $seatingCapacity,
+                $rentPerDay,
+                (int) $form['is_available'],
+            ]);
+
+            $insertSucceeded = true;
+        } catch (PDOException $primaryException) {
+            try {
+                // Fallback path for legacy deployments with extra required columns in `cars`.
+                $fallbackInsertValues = cars_build_insert_values($pdo, $baseInsertValues);
+
+                if ($fallbackInsertValues === []) {
+                    throw new RuntimeException('No insertable columns available for cars table.');
+                }
+
+                $columns = array_keys($fallbackInsertValues);
+                $placeholders = implode(', ', array_fill(0, count($columns), '?'));
+                $quotedColumns = implode(', ', array_map(static function (string $column): string {
+                    return '`' . str_replace('`', '``', $column) . '`';
+                }, $columns));
+
+                $fallbackInsertStmt = $pdo->prepare('INSERT INTO cars (' . $quotedColumns . ') VALUES (' . $placeholders . ')');
+                $fallbackInsertStmt->execute(array_values($fallbackInsertValues));
+                $insertSucceeded = true;
+            } catch (Throwable $fallbackException) {
+                error_log(sprintf(
+                    '[%s] Car insert failed. Primary: %s | Fallback: %s',
+                    date('c'),
+                    $primaryException->getMessage(),
+                    $fallbackException->getMessage()
+                ));
+
+                $errors[] = 'Could not save car due to a deployment schema issue. Please try again or contact support.';
+            }
+        }
+
+        if ($insertSucceeded) {
+            flash('success', 'Car added to your fleet successfully.');
+            redirect('agency/cars.php');
+        }
     }
 }
 
