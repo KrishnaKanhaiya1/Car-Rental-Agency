@@ -25,6 +25,7 @@ function cars_table_columns(PDO $pdo): array
                 COLUMN_TYPE,
                 IS_NULLABLE,
                 COLUMN_DEFAULT,
+            COLUMN_KEY,
                 CHARACTER_MAXIMUM_LENGTH,
                 EXTRA
          FROM information_schema.columns
@@ -85,7 +86,10 @@ function cars_apply_column_constraints($value, array $columnMeta)
  */
 function cars_required_fallback_value(string $columnName, array $columnMeta, array $sampleRow)
 {
-    if (array_key_exists($columnName, $sampleRow) && $sampleRow[$columnName] !== null) {
+    $columnKey = strtoupper((string) ($columnMeta['COLUMN_KEY'] ?? ''));
+    $canReuseSampleValue = $columnKey !== 'PRI' && $columnKey !== 'UNI';
+
+    if ($canReuseSampleValue && array_key_exists($columnName, $sampleRow) && $sampleRow[$columnName] !== null) {
         return cars_apply_column_constraints($sampleRow[$columnName], $columnMeta);
     }
 
@@ -125,6 +129,61 @@ function cars_required_fallback_value(string $columnName, array $columnMeta, arr
 
 /**
  * @param array<string, mixed> $baseValues
+ * @param mixed $value
+ */
+function cars_guess_column_value(string $columnName, array $baseValues, &$value): bool
+{
+    $aliases = [
+        'agency_id' => 'agency_id',
+        'owner_id' => 'agency_id',
+        'user_id' => 'agency_id',
+        'company_id' => 'agency_id',
+        'vendor_id' => 'agency_id',
+        'provider_id' => 'agency_id',
+        'model' => 'model',
+        'vehicle_model' => 'model',
+        'car_model' => 'model',
+        'name' => 'model',
+        'vehicle_number' => 'vehicle_number',
+        'number' => 'vehicle_number',
+        'vehicle_no' => 'vehicle_number',
+        'vehicle_num' => 'vehicle_number',
+        'car_number' => 'vehicle_number',
+        'number_plate' => 'vehicle_number',
+        'plate_number' => 'vehicle_number',
+        'registration_number' => 'vehicle_number',
+        'registration_no' => 'vehicle_number',
+        'seating_capacity' => 'seating_capacity',
+        'capacity' => 'seating_capacity',
+        'seats' => 'seating_capacity',
+        'seat_capacity' => 'seating_capacity',
+        'rent_per_day' => 'rent_per_day',
+        'daily_rent' => 'rent_per_day',
+        'price_per_day' => 'rent_per_day',
+        'rent_perday' => 'rent_per_day',
+        'rent' => 'rent_per_day',
+        'is_available' => 'is_available',
+        'available' => 'is_available',
+    ];
+
+    $normalized = strtolower($columnName);
+
+    if (!isset($aliases[$normalized])) {
+        return false;
+    }
+
+    $baseKey = $aliases[$normalized];
+
+    if (!array_key_exists($baseKey, $baseValues)) {
+        return false;
+    }
+
+    $value = $baseValues[$baseKey];
+    return true;
+}
+
+/**
+ * @param array<string, mixed> $baseValues
  * @return array<string, mixed>
  */
 function cars_build_insert_values(PDO $pdo, array $baseValues): array
@@ -149,6 +208,13 @@ function cars_build_insert_values(PDO $pdo, array $baseValues): array
 
         if (array_key_exists($columnName, $baseValues)) {
             $insertValues[$columnName] = cars_apply_column_constraints($baseValues[$columnName], $columnMeta);
+            continue;
+        }
+
+        $guessedValue = null;
+
+        if (cars_guess_column_value($columnName, $baseValues, $guessedValue)) {
+            $insertValues[$columnName] = cars_apply_column_constraints($guessedValue, $columnMeta);
             continue;
         }
 
